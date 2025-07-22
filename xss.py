@@ -7,6 +7,14 @@ from urllib.parse import urljoin, urlparse
 from queue import Queue
 import json
 import os
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from bs4 import BeautifulSoup
+import time
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import WebDriverException
 
 # 🚨 高危 API/属性关键字
 DANGEROUS_PATTERNS = [
@@ -29,6 +37,14 @@ DANGEROUS_PATTERNS = [
     r"jQuery\.attr\s*\(",
     r"on\w+\s*=",
     r"javascript\s*:",
+    r"<input\b[^>]*>",
+]
+
+# API端点常见路径
+API_PATHS = [
+    'api', 'graphql', 'rest', 'v1', 'v2', 
+    'oauth', 'auth', 'login', 'logout',
+    'user', 'users', 'account', 'admin'
 ]
 
 HEADERS = {
@@ -36,188 +52,548 @@ HEADERS = {
 }
 
 results = []
+crawled_urls = []
 lock = threading.Lock()
 
-
-# 🕷 自动爬取站点页面
-def crawl_site(base_url, log, max_pages=100):
-    visited = set()
-    queue = Queue()
-    queue.put(base_url)
-    found_urls = []
-
-    log.insert(tk.END, f"🌐 Crawling site: {base_url}\n")
-    while not queue.empty() and len(visited) < max_pages:
-        url = queue.get()
-        if url in visited:
-            continue
-        visited.add(url)
-
+class Crawler:
+    def __init__(self, base_url, log, max_depth=3, max_pages=50, dynamic=False):
+        self.base_url = base_url
+        self.log = log
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.dynamic = dynamic
+        self.visited = set()
+        self.queue = Queue()
+        self.domain = urlparse(base_url).netloc
+        self.driver = None
+        
+        if dynamic:
+            self.init_selenium()
+            
+    def deep_dom_scan(self, url):
+        if not self.driver:
+            return []
+        
         try:
-            res = requests.get(url, headers=HEADERS, timeout=10)
-            if "text/html" not in res.headers.get("Content-Type", ""):
-                continue  # 只爬 HTML 页面
+            self.driver.get(url)
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
 
-            found_urls.append(url)
-            log.insert(tk.END, f"🔗 Found: {url}\n")
+            # 核心JS探测脚本
+            scan_js = """
+            // 1. 获取所有隐藏输入字段
+            const hiddenInputs = Array.from(document.querySelectorAll('input[type=hidden]')).map(el => ({
+                name: el.name,
+                value: el.value,
+                id: el.id,
+                outerHTML: el.outerHTML
+            }));
 
-            links = re.findall(r'href=["\'](.*?)["\']', res.text, flags=re.IGNORECASE)
-            for link in links:
-                full_url = urljoin(url, link)
-                if urlparse(full_url).netloc == urlparse(base_url).netloc:
-                    if full_url not in visited:
-                        queue.put(full_url)
+            // 2. 探测动态生成的DOM
+            const dynamicElements = Array.from(document.querySelectorAll('[data-*]')).map(el => ({
+                tag: el.tagName,
+                attributes: Array.from(el.attributes).map(attr => ({
+                    name: attr.name,
+                    value: attr.value
+                }))
+            }));
+
+            // 3. 检查Shadow DOM
+            const shadowContent = [];
+            document.querySelectorAll('*').forEach(el => {
+                if (el.shadowRoot) {
+                    shadowContent.push({
+                        host: el.tagName,
+                        html: el.shadowRoot.innerHTML
+                    });
+                }
+            });
+
+            return {
+                hiddenInputs,
+                dynamicElements,
+                shadowContent
+            };
+            """
+            
+            # 执行探测
+            dom_data = self.driver.execute_script(scan_js)
+            
+            # 处理结果
+            risks = []
+            for inp in dom_data['hiddenInputs']:
+                if inp['name'] == 'etd':  # 针对您的用例
+                    risks.append({
+                        'type': 'Hidden Input',
+                        'field': inp
+                    })
+            
+            return risks
+
         except Exception as e:
-            log.insert(tk.END, f"⚠️ Error fetching {url}: {e}\n")
-    log.insert(tk.END, f"✅ Total pages found: {len(found_urls)}\n")
-    return found_urls
+            print(f"深度扫描失败: {str(e)}")
+            return []
 
-
-# ⚡ 多线程扫描 HTML 页面
-def scan_html_page(url, log, progress, total, current):
-    try:
+    def init_selenium(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument('--ignore-certificate-errors')
+        chrome_options.add_argument('--allow-running-insecure-content')
+        self.driver = webdriver.Chrome(options=chrome_options)
+    
+    def close_selenium(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+    
+    def crawl(self):
+        self.queue.put((self.base_url, 0))
+        
+        while not self.queue.empty() and len(self.visited) < self.max_pages:
+            url, depth = self.queue.get()
+            
+            if url in self.visited or depth > self.max_depth:
+                continue
+                
+            self.visited.add(url)
+            
+            try:
+                if self.dynamic:
+                    content, links = self.crawl_dynamic(url)
+                else:
+                    content, links = self.crawl_static(url)
+                
+                crawled_urls.append(url)
+                with lock:
+                    self.log.insert(tk.END, f"🔗 深度 {depth}: {url}\n")
+                
+                # 发现API端点
+                api_endpoints = self.find_api_endpoints(url, content)
+                for api in api_endpoints:
+                    if api not in self.visited:
+                        self.queue.put((api, depth + 1))
+                        with lock:
+                            self.log.insert(tk.END, f"   ➤ 发现API端点: {api}\n")
+                
+                # 添加新链接到队列
+                for link in links:
+                    if link not in self.visited and link not in [q[0] for q in self.queue.queue]:
+                        self.queue.put((link, depth + 1))
+            
+            except Exception as e:
+                with lock:
+                    self.log.insert(tk.END, f"⚠️ 抓取 {url} 出错: {str(e)[:100]}\n")
+        
+        self.close_selenium()
+        return list(self.visited)
+    
+    def crawl_static(self, url):
         res = requests.get(url, headers=HEADERS, timeout=10)
         content = res.text
+        
+        # 提取所有链接
+        links = set()
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe']):
+            attr = 'href' if tag.name in ['a', 'link'] else 'src'
+            if attr in tag.attrs:
+                link = urljoin(url, tag[attr])
+                if self.is_valid_url(link):
+                    links.add(link)
+        
+        return content, list(links)
+    
+    def crawl_dynamic(self, url):
+        if not self.driver:
+            return "", []
+            
+        try:
+            self.driver.get(url)
+            time.sleep(2)  # 更智能的等待方式
+            WebDriverWait(self.driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            
+            content = self.driver.page_source
+            
+            # 修复点1：使用新的find_elements API
+            elements = self.driver.find_elements(By.XPATH, "//*[@href or @src]")
+            links = set()
+            
+            for el in elements:
+                try:
+                    link = el.get_attribute('href') or el.get_attribute('src')
+                    if link and self.is_valid_url(link):
+                        links.add(link)
+                except:
+                    continue
+                    
+            return content, list(links)
+            
+        except WebDriverException as e:
+            with lock:
+                self.log.insert(tk.END, f"⚠️ 动态抓取 {url} 出错: {str(e)[:100]}\n")
+            return "", []
+    
+    def is_valid_url(self, url):
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        if parsed.netloc != self.domain:
+            return False
+        if parsed.path.endswith(('.jpg', '.png', '.gif', '.css', '.pdf')):
+            return False
+        return True
+    
+    def find_api_endpoints(self, url, content):
+        endpoints = set()
+        
+        # 从HTML内容中查找API路径
+        api_pattern = r'["\'](/[^"\']*?(?:{})(?:/[^"\']*)?)["\']'.format('|'.join(API_PATHS))
+        matches = re.findall(api_pattern, content, re.IGNORECASE)
+        
+        for match in matches:
+            endpoint = urljoin(url, match)
+            if self.is_valid_url(endpoint):
+                endpoints.add(endpoint)
+        
+        # 从JavaScript代码中查找API调用
+        js_pattern = r'(?:fetch|axios|ajax|XMLHttpRequest)\s*\(\s*["\']([^"\']*?)["\']'
+        js_matches = re.findall(js_pattern, content, re.IGNORECASE)
+        
+        for match in js_matches:
+            endpoint = urljoin(url, match)
+            if self.is_valid_url(endpoint):
+                endpoints.add(endpoint)
+        
+        return list(endpoints)
 
+class Scanner:
+    def __init__(self, log, progress, total_urls):
+        self.log = log
+        self.progress = progress
+        self.total = total_urls
+        self.current = 0
+    
+    def scan_all(self, urls):
+        threads = []
+        
+        for url in urls:
+            t = threading.Thread(target=self.scan_url, args=(url,), daemon=True)
+            t.start()
+            threads.append(t)
+        
+        for t in threads:
+            t.join()
+    
+    def scan_url(self, url):
+        try:
+            content_type = self.get_content_type(url)
+            
+            if "text/html" in content_type:
+                self.scan_html(url)
+            elif "application/javascript" in content_type:
+                self.scan_js(url)
+            elif "application/json" in content_type:
+                self.scan_json(url)
+            
+        except Exception as e:
+            with lock:
+                self.log.insert(tk.END, f"❌ 扫描 {url} 出错: {str(e)[:100]}\n")
+        finally:
+            with lock:
+                self.current += 1
+                self.progress["value"] = (self.current / self.total) * 100
+    
+    def get_content_type(self, url):
+        try:
+            res = requests.head(url, headers=HEADERS, timeout=5)
+            return res.headers.get("Content-Type", "").lower()
+        except:
+            return ""
+    
+    def scan_html(self, url):
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        content = res.text
+        
         findings = []
         for pattern in DANGEROUS_PATTERNS:
             matches = re.findall(pattern, content, flags=re.IGNORECASE | re.DOTALL)
             if matches:
                 findings.append((pattern, matches))
-
+        
         if findings:
             with lock:
-                log.insert(tk.END, f"🚨 XSS risks found on {url}\n", "alert")
+                self.log.insert(tk.END, f"🚨 HTML XSS风险: {url}\n", "alert")
                 for pattern, matches in findings:
-                    log.insert(tk.END, f"  🔸 Pattern: {pattern}\n")
+                    self.log.insert(tk.END, f"  🔸 模式: {pattern}\n")
                     for match in matches[:3]:
-                        log.insert(tk.END, f"     ➡ {match[:80]}...\n")
+                        self.log.insert(tk.END, f"     ➡ {match[:80]}...\n")
+            
             results.append({
                 "url": url,
                 "type": "HTML",
                 "issues": [{"pattern": p, "examples": m[:5]} for p, m in findings]
             })
-        else:
-            with lock:
-                log.insert(tk.END, f"✅ No obvious XSS patterns found on {url}\n")
-    except Exception as e:
-        with lock:
-            log.insert(tk.END, f"❌ Error scanning {url}: {e}\n")
-    finally:
-        with lock:
-            current[0] += 1
-            progress["value"] = (current[0] / total[0]) * 100
-
-
-# 📤 扫描 JSON API 响应
-def scan_json_api(url, log, progress, total, current):
-    try:
+    
+    def scan_js(self, url):
         res = requests.get(url, headers=HEADERS, timeout=10)
-        if "application/json" in res.headers.get("Content-Type", ""):
+        content = res.text
+        
+        findings = []
+        js_patterns = [
+            r"\.innerHTML\s*=",
+            r"document\.write\s*\(",
+            r"eval\s*\(",
+            r"new Function\s*\(",
+            r"setTimeout\s*\(.*['\"]",
+            r"setInterval\s*\(.*['\"]",
+            r"location\.(href|assign|replace)\s*=",
+            r"window\.open\s*\(",
+            r"\.src\s*=",
+            r"\.postMessage\s*\("
+        ]
+        
+        for pattern in js_patterns:
+            matches = re.findall(pattern, content, flags=re.IGNORECASE)
+            if matches:
+                findings.append((pattern, matches))
+        
+        if findings:
+            with lock:
+                self.log.insert(tk.END, f"🚨 JS文件XSS风险: {url}\n", "alert")
+                for pattern, matches in findings:
+                    self.log.insert(tk.END, f"  🔸 模式: {pattern}\n")
+                    for match in matches[:3]:
+                        self.log.insert(tk.END, f"     ➡ {match[:80]}...\n")
+            
+            results.append({
+                "url": url,
+                "type": "JavaScript",
+                "issues": [{"pattern": p, "examples": m[:5]} for p, m in findings]
+            })
+    
+    def scan_json(self, url):
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        try:
             data = res.json()
             json_str = json.dumps(data)
+            
             findings = []
             for pattern in DANGEROUS_PATTERNS:
                 matches = re.findall(pattern, json_str, flags=re.IGNORECASE)
                 if matches:
                     findings.append((pattern, matches))
-
+            
             if findings:
                 with lock:
-                    log.insert(tk.END, f"🚨 XSS risks found in JSON API {url}\n", "alert")
+                    self.log.insert(tk.END, f"🚨 JSON API XSS风险: {url}\n", "alert")
                     for pattern, matches in findings:
-                        log.insert(tk.END, f"  🔸 Pattern: {pattern}\n")
+                        self.log.insert(tk.END, f"  🔸 模式: {pattern}\n")
                         for match in matches[:3]:
-                            log.insert(tk.END, f"     ➡ {match[:80]}...\n")
+                            self.log.insert(tk.END, f"     ➡ {match[:80]}...\n")
+                
                 results.append({
                     "url": url,
                     "type": "JSON API",
                     "issues": [{"pattern": p, "examples": m[:5]} for p, m in findings]
                 })
-    except:
-        pass
-    finally:
-        with lock:
-            current[0] += 1
-            progress["value"] = (current[0] / total[0]) * 100
+        except:
+            pass
 
-
-# 📄 保存 HTML 报告
 def save_report(results, filename="xss_scan_report.html"):
     html = """
-    <html><head><title>XSS Scan Report</title>
+    <html><head><title>XSS扫描报告</title>
     <style>
-    body { font-family: Arial, sans-serif; }
-    h2 { color: #d9534f; }
-    pre { background: #f9f9f9; padding: 10px; border: 1px solid #ccc; }
+    body { font-family: Arial, sans-serif; line-height: 1.6; }
+    h1 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+    h2 { color: #d9534f; margin-top: 30px; }
+    .url { color: #337ab7; font-weight: bold; }
+    .issue { background: #f9f9f9; border-left: 4px solid #d9534f; padding: 10px; margin: 10px 0; }
+    .pattern { color: #5bc0de; }
+    pre { background: #f5f5f5; padding: 10px; border-radius: 3px; overflow-x: auto; }
     </style></head><body>
-    <h1>XSS Scan Report</h1>
+    <h1>XSS漏洞扫描报告</h1>
+    <p>扫描时间: {time}</p>
     """
+    
+    from datetime import datetime
+    html = html.format(time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    
     for r in results:
-        html += f"<h2>{r['type']} - {r['url']}</h2>"
+        html += f"""
+        <div class="result">
+            <h2>{r['type']}</h2>
+            <p class="url">{r['url']}</p>
+        """
+        
         for issue in r["issues"]:
-            html += f"<p><b>Pattern:</b> {issue['pattern']}</p>"
-            html += "<pre>" + "\n".join(issue["examples"]) + "</pre>"
+            html += f"""
+            <div class="issue">
+                <p class="pattern">危险模式: {issue['pattern']}</p>
+                <p>示例:</p>
+                <pre>{'\n'.join(issue['examples'])}</pre>
+            </div>
+            """
+        
+        html += "</div>"
+    
     html += "</body></html>"
-
+    
     with open(filename, "w", encoding="utf-8") as f:
         f.write(html)
     return os.path.abspath(filename)
 
-
-# 🖥 GUI 主界面
 def create_gui():
     root = tk.Tk()
-    root.title("XSS 全功能扫描器")
-    root.geometry("800x600")
-
-    tk.Label(root, text="📂 URL 列表文件 (.txt 每行一个 URL):").pack(pady=5)
-    entry = tk.Entry(root, width=80)
-    entry.pack()
-    tk.Button(root, text="浏览", command=lambda: load_url_file(entry)).pack(pady=5)
-
-    progress = ttk.Progressbar(root, length=700)
+    root.title("高级XSS扫描器 v2.0")
+    root.geometry("900x700")
+    
+    # 配置区域
+    config_frame = tk.Frame(root)
+    config_frame.pack(pady=10, fill=tk.X)
+    
+    tk.Label(config_frame, text="🌐 目标URL列表 (每行一个URL):").grid(row=0, column=0, sticky='nw')
+    
+    # 创建带滚动条的URL输入框
+    url_frame = tk.Frame(config_frame)
+    url_frame.grid(row=1, column=0, columnspan=3, sticky='ew')
+    
+    url_text = scrolledtext.ScrolledText(url_frame, height=8, wrap=tk.WORD)
+    url_text.pack(fill=tk.BOTH, expand=True)
+    
+    # 添加示例URL按钮
+    def add_example_urls():
+        example_urls = """http://example.com
+https://test-site.com
+http://demo.org/admin"""
+        url_text.delete(1.0, tk.END)
+        url_text.insert(tk.END, example_urls)
+    
+    example_btn = tk.Button(config_frame, text="添加示例URL", command=add_example_urls)
+    example_btn.grid(row=2, column=0, sticky='w', pady=5)
+    
+    # 其他配置选项
+    tk.Label(config_frame, text="爬取深度:").grid(row=3, column=0, sticky='w')
+    depth_spin = tk.Spinbox(config_frame, from_=1, to=5, width=5)
+    depth_spin.grid(row=3, column=1, sticky='w', padx=5)
+    
+    tk.Label(config_frame, text="最大页面数:").grid(row=4, column=0, sticky='w')
+    max_pages_spin = tk.Spinbox(config_frame, from_=10, to=500, width=5)
+    max_pages_spin.grid(row=4, column=1, sticky='w', padx=5)
+    
+    dynamic_var = tk.IntVar()
+    tk.Checkbutton(config_frame, text="动态内容分析(Selenium)", variable=dynamic_var).grid(row=5, column=0, columnspan=2, sticky='w')
+    
+    # 进度条
+    progress = ttk.Progressbar(root, length=800)
     progress.pack(pady=5)
-
-    log = scrolledtext.ScrolledText(root, height=20)
-    log.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+    
+    # 日志区域
+    log_frame = tk.Frame(root)
+    log_frame.pack(pady=10, fill=tk.BOTH, expand=True)
+    
+    log = scrolledtext.ScrolledText(log_frame, height=25)
+    log.pack(fill=tk.BOTH, expand=True)
     log.tag_config("alert", foreground="red")
-    log.tag_config("title", foreground="blue", font=("Arial", 10, "bold"))
-
-    def run_scan():
-        url_file = entry.get().strip()
-        if not os.path.isfile(url_file):
-            messagebox.showerror("Error", "请先选择有效的 URL 列表文件！")
-            return
-        with open(url_file, "r", encoding="utf-8") as f:
-            url_list = [line.strip() for line in f if line.strip()]
+    log.tag_config("success", foreground="green")
+    
+    # 按钮区域
+    button_frame = tk.Frame(root)
+    button_frame.pack(pady=10)
+    
+    def run_crawl():
+        url_list = url_text.get(1.0, tk.END).strip().split('\n')
+        url_list = [url.strip() for url in url_list if url.strip()]
+        
         if not url_list:
-            messagebox.showerror("Error", "URL 列表为空！")
+            messagebox.showerror("错误", "请输入至少一个有效的URL！")
             return
-
-        total = [len(url_list) * 2]  # HTML + JSON
-        current = [0]
-        progress["maximum"] = 100
-        progress["value"] = 0
-
-        # 多线程扫描 HTML
+            
+        # 检查并修正URL格式
+        processed_urls = []
         for url in url_list:
-            threading.Thread(target=scan_html_page, args=(url, log, progress, total, current), daemon=True).start()
-        # 多线程扫描 JSON
-        for url in url_list:
-            threading.Thread(target=scan_json_api, args=(url, log, progress, total, current), daemon=True).start()
-
-    tk.Button(root, text="开始扫描", command=run_scan, bg="green", fg="white").pack(pady=10)
+            if not url.startswith(('http://', 'https://')):
+                url = 'http://' + url
+            processed_urls.append(url)
+        
+        # 清空之前的结果
+        global results, crawled_urls
+        results = []
+        crawled_urls = []
+        
+        log.delete(1.0, tk.END)
+        log.insert(tk.END, f"🕷 开始爬取 {len(processed_urls)} 个网站...\n")
+        
+        def crawl_thread():
+            try:
+                for url in processed_urls:
+                    log.insert(tk.END, f"\n=== 开始处理: {url} ===\n")
+                    crawler = Crawler(
+                        base_url=url,
+                        log=log,
+                        max_depth=int(depth_spin.get()),
+                        max_pages=int(max_pages_spin.get()),
+                        dynamic=bool(dynamic_var.get())
+                    )
+                    crawled_urls.extend(crawler.crawl())
+                
+                log.insert(tk.END, "\n✅ 所有URL爬取完成！\n", "success")
+                log.insert(tk.END, f"共找到 {len(crawled_urls)} 个URL\n")
+                
+                # 启用扫描按钮
+                scan_btn.config(state=tk.NORMAL)
+            except Exception as e:
+                log.insert(tk.END, f"❌ 爬取过程中出错: {str(e)}\n")
+        
+        threading.Thread(target=crawl_thread, daemon=True).start()
+    
+    def run_scan():
+        if not crawled_urls:
+            messagebox.showerror("错误", "请先爬取URL！")
+            return
+            
+        log.insert(tk.END, "\n⚡ 开始扫描漏洞...\n")
+        
+        def scan_thread():
+            try:
+                scanner = Scanner(log, progress, len(crawled_urls))
+                scanner.scan_all(crawled_urls)
+                
+                log.insert(tk.END, "\n✅ 扫描完成！\n", "success")
+                log.insert(tk.END, f"共发现 {len(results)} 处潜在漏洞\n")
+                
+                # 生成报告
+                report_path = save_report(results)
+                log.insert(tk.END, f"\n📄 报告已保存到: {report_path}\n", "success")
+                
+                # 显示报告按钮
+                report_btn.config(state=tk.NORMAL)
+            except Exception as e:
+                log.insert(tk.END, f"❌ 扫描过程中出错: {str(e)}\n")
+        
+        threading.Thread(target=scan_thread, daemon=True).start()
+    
+    def show_report():
+        report_path = save_report(results)
+        os.startfile(report_path)
+    
+    crawl_btn = tk.Button(button_frame, text="开始爬取", command=run_crawl, bg="#5bc0de", fg="white")
+    crawl_btn.pack(side=tk.LEFT, padx=5)
+    
+    scan_btn = tk.Button(button_frame, text="开始扫描", command=run_scan, bg="#5cb85c", fg="white", state=tk.DISABLED)
+    scan_btn.pack(side=tk.LEFT, padx=5)
+    
+    report_btn = tk.Button(button_frame, text="查看报告", command=show_report, bg="#f0ad4e", fg="white", state=tk.DISABLED)
+    report_btn.pack(side=tk.LEFT, padx=5)
+    
     root.mainloop()
-
-
-# 打开文件选择
-def load_url_file(entry):
-    file_path = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt")])
-    if file_path:
-        entry.delete(0, tk.END)
-        entry.insert(0, file_path)
-
 
 if __name__ == "__main__":
     create_gui()
